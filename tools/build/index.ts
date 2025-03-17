@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021 Martin Donath <martin.donath@squidfunk.com>
+ * Copyright (c) 2016-2023 Martin Donath <martin.donath@squidfunk.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -20,28 +20,26 @@
  * IN THE SOFTWARE.
  */
 
-import { minify as minhtml } from "html-minifier"
+import { minify as minhtml } from "html-minifier-terser"
 import * as path from "path"
 import {
   EMPTY,
   concat,
-  concatMap,
   defer,
+  from,
+  identity,
   map,
   merge,
+  mergeMap,
   of,
   reduce,
   scan,
   startWith,
   switchMap,
-  switchMapTo,
   toArray,
   zip
 } from "rxjs"
-import {
-  extendDefaultPlugins,
-  optimize
-} from "svgo"
+import { optimize } from "svgo"
 
 import { IconSearchIndex } from "_/components"
 
@@ -51,6 +49,7 @@ import {
   transformScript,
   transformStyle
 } from "./transform"
+import glob from "tiny-glob"
 
 /* ----------------------------------------------------------------------------
  * Helper types
@@ -90,14 +89,98 @@ function ext(file: string, extension: string): string {
  * @returns Minified SVG data
  */
 function minsvg(data: string): string {
+  if (!data.startsWith("<"))
+    return data
+
+  /* Optimize SVG */
   const result = optimize(data, {
-    plugins: extendDefaultPlugins([
-      { name: "removeDimensions", active: true },
-      { name: "removeViewBox", active: false }
-    ])
+    plugins: [
+      {
+        name: "preset-default",
+        params: {
+          overrides: {
+            removeViewBox: false
+          }
+        }
+      },
+      {
+        name: "removeDimensions"
+      }
+    ]
   })
-  return result.data || data
+
+  /* Return minified SVG */
+  return result.data
 }
+
+/**
+ * Return a path with POSIX style separators
+ *
+ * The default function assumes UNIX system, so it just returns the path.
+ *
+ * @param p - string path
+ * @returns String path
+ */
+let assurePosixSep = function (p: string): string {
+  return p
+};
+
+/**
+ * Return a path with POSIX style separators
+ *
+ * The Windows variant of this function replaces the separator with regex.
+ *
+ * @param p - string path
+ * @returns String path
+ */
+function assurePosixSepWin(p: string): string {
+  return p.replace(winSepRegex, path.posix.sep)
+};
+
+const winSepRegex = new RegExp(`\\${path.win32.sep}`, "g");
+
+if (path.sep === path.win32.sep) {
+  assurePosixSep = assurePosixSepWin;
+}
+
+/**
+ * Compare two path strings to decide on the order
+ *
+ * On Windows the default order of paths containing `_` from the resolve function
+ * is different than on macOS. This function restores the order to the usual.
+ * Implementation adapted based on https://t.ly/VJp78
+ *
+ * Note: The paths should have no extension like .svg, just the name. Otherwise
+ * it won't check the compare.startsWith(reference) properly.
+ *
+ * @param reference Left string to compare
+ * @param compare Right string to compare against
+ * @returns Number for the sort function to define the order
+ */
+function sortOrderForWindows(reference: string, compare: string): number {
+  reference = reference.toLowerCase();
+  compare = compare.toLowerCase();
+
+  const length = Math.min(reference.length, compare.length);
+
+  for (let i = 0; i < length; i++) {
+    const leftChar = reference[i];
+    const rightChar = compare[i];
+
+    if (leftChar !== rightChar)
+      return customAlphabet.indexOf(leftChar) - customAlphabet.indexOf(rightChar);
+  }
+
+  if (reference.length !== compare.length) {
+    if (compare.startsWith(reference) && compare[reference.length] === "-")
+      return 1;
+    return reference.length - compare.length;
+  }
+
+  return 0;
+}
+
+const customAlphabet: string = "_,-./0123456789abcdefghijklmnopqrstuvwxyz";
 
 /* ----------------------------------------------------------------------------
  * Tasks
@@ -110,7 +193,7 @@ const assets$ = concat(
   ...["*.svg", "../LICENSE"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@mdi/svg/svg",
-      to: `${base}/.icons/material`,
+      to: `${base}/templates/.icons/material`,
       transform: async data => minsvg(data)
     })),
 
@@ -118,7 +201,7 @@ const assets$ = concat(
   ...["*.svg", "../../LICENSE"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@primer/octicons/build/svg",
-      to: `${base}/.icons/octicons`,
+      to: `${base}/templates/.icons/octicons`,
       transform: async data => minsvg(data)
     })),
 
@@ -126,7 +209,15 @@ const assets$ = concat(
   ...["**/*.svg", "../LICENSE.txt"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@fortawesome/fontawesome-free/svgs",
-      to: `${base}/.icons/fontawesome`,
+      to: `${base}/templates/.icons/fontawesome`,
+      transform: async data => minsvg(data)
+    })),
+
+  /* Copy Simple icons */
+  ...["**/*.svg", "../LICENSE.md"]
+    .map(pattern => copyAll(pattern, {
+      from: "node_modules/simple-icons/icons",
+      to: `${base}/templates/.icons/simple`,
       transform: async data => minsvg(data)
     })),
 
@@ -134,24 +225,39 @@ const assets$ = concat(
   ...["min/*.js", "tinyseg.js", "wordcut.js"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/lunr-languages",
-      to: `${base}/assets/javascripts/lunr`
+      to: `${base}/templates/assets/javascripts/lunr`
     })),
 
   /* Copy images and configurations */
-  ...[".icons/*.svg", "assets/images/*", "**/*.{py,yml}"]
+  ...["**/*.{jpg,png,svg,yml}"]
     .map(pattern => copyAll(pattern, {
       from: "src",
       to: base
     }))
 )
 
+/* Copy plugins and extensions */
+const sources$ = copyAll("**/*.py", {
+  from: "src",
+  to: base,
+  watch: process.argv.includes("--watch"),
+  transform: async (data, name) => {
+    if (path.basename(name) === "__init__.py") {
+      const metadata = require("../../package.json")
+      return data.replace("$md-version$", metadata.version)
+    } else {
+      return data
+    }
+  }
+})
+
 /* ------------------------------------------------------------------------- */
 
 /* Transform styles */
 const stylesheets$ = resolve("**/[!_]*.scss", { cwd: "src" })
   .pipe(
-    concatMap(file => zip(
-      of(ext(file, ".css")),
+    mergeMap(file => zip(
+      of(ext(file, ".css").replace(new RegExp(`(overrides|templates)\\${path.sep}`), "")),
       transformStyle({
         from: `src/${file}`,
         to: ext(`${base}/${file}`, ".css")
@@ -160,10 +266,10 @@ const stylesheets$ = resolve("**/[!_]*.scss", { cwd: "src" })
   )
 
 /* Transform scripts */
-const javascripts$ = resolve("**/{bundle,search}.ts", { cwd: "src" })
+const javascripts$ = resolve("**/{custom,bundle,search}.ts", { cwd: "src" })
   .pipe(
-    concatMap(file => zip(
-      of(ext(file, ".js")),
+    mergeMap(file => zip(
+      of(ext(file, ".js").replace(new RegExp(`(overrides|templates)\\${path.sep}`), "")),
       transformScript({
         from: `src/${file}`,
         to: ext(`${base}/${file}`, ".js")
@@ -179,19 +285,24 @@ const manifest$ = merge(
   })
     .map(([pattern, observable$]) => (
       defer(() => process.argv.includes("--watch")
-        ? watch(pattern, { cwd: "src" })
+        ? from(glob(pattern, { cwd: "src" })).pipe(
+          switchMap(files => watch(files, { cwd: "src" }))
+        )
         : EMPTY
       )
         .pipe(
           startWith("*"),
-          switchMapTo(observable$.pipe(toArray()))
+          switchMap(() => observable$.pipe(toArray()))
         )
     ))
 )
   .pipe(
     scan((prev, mapping) => (
       mapping.reduce((next, [key, value]) => (
-        next.set(key, value.replace(`${base}/`, ""))
+        next.set(assurePosixSep(key), assurePosixSep(value.replace(
+          new RegExp(`${base}\\/(overrides|templates)\\${path.sep}`),
+          ""
+        )))
       ), prev)
     ), new Map<string, string>()),
   )
@@ -220,7 +331,7 @@ const templates$ = manifest$
 
         /* Normalize line feeds and minify HTML */
         const html = data.replace(/\r\n/gm, "\n")
-        return banner + minhtml(html, {
+        return banner + await minhtml(html, {
           collapseBooleanAttributes: true,
           includeAutoGeneratedTags: false,
           minifyCSS: true,
@@ -229,13 +340,15 @@ const templates$ = manifest$
           removeScriptTypeAttributes: true,
           removeStyleLinkTypeAttributes: true
         })
+          .then(html => html
 
-          /* Remove empty lines without collapsing everything */
-          .replace(/^\s*[\r\n]/gm, "")
+            /* Remove empty lines without collapsing everything */
+            .replace(/^\s*[\r\n]/gm, "")
 
-          /* Write theme version into template */
-          .replace("$md-name$", metadata.name)
-          .replace("$md-version$", metadata.version)
+            /* Write theme version into template */
+            .replace("$md-name$", metadata.name)
+            .replace("$md-version$", metadata.version)
+          )
       }
     }))
   )
@@ -243,12 +356,20 @@ const templates$ = manifest$
 /* ------------------------------------------------------------------------- */
 
 /* Compute icon mappings */
-const icons$ = defer(() => resolve("**/*.svg", { cwd: "material/.icons" }))
+const icons$ = defer(() => resolve("**/*.svg", {
+  cwd: `${base}/templates/.icons`
+}))
   .pipe(
     reduce((index, file) => index.set(
-      file.replace(/\.svg$/, "").replace(/\//g, "-"),
-      file
-    ), new Map<string, string>())
+      file.replace(/\.svg$/, "").replace(new RegExp(`\\${path.sep}`, "g"), "-"),
+      assurePosixSep(file)
+    ), new Map<string, string>()),
+    // The icons are stored in the index file, and the output needs to be OS
+    // agnostic. Some icons contain the `_` character, which has different order
+    // in the glob output on Windows.
+    (path.sep === path.win32.sep) ? map(icons => new Map(
+      [...icons].sort((a, b) => sortOrderForWindows(a[0], b[0]))
+    )) : identity
   )
 
 /* Compute emoji mappings (based on Twemoji) */
@@ -272,11 +393,11 @@ const index$ = zip(icons$, emojis$)
       const cdn = "https://raw.githubusercontent.com"
       return {
         icons: {
-          base: `${cdn}/squidfunk/mkdocs-material/master/material/.icons/`,
+          base: `${cdn}/squidfunk/mkdocs-material/master/material/templates/.icons/`,
           data: Object.fromEntries(icons)
         },
         emojis: {
-          base: `${cdn}/twitter/twemoji/master/assets/svg/`,
+          base: `${cdn}/jdecked/twemoji/master/assets/svg/`,
           data: Object.fromEntries(emojis)
         }
       } as IconSearchIndex
@@ -287,6 +408,61 @@ const index$ = zip(icons$, emojis$)
     ))
   )
 
+/* ------------------------------------------------------------------------- */
+
+/* Build schema */
+const schema$ = merge(
+
+  /* Compute fonts schema */
+  defer(() => import("google-fonts-complete"))
+    .pipe(
+      map(({ default: fonts }) => Object.keys(fonts)),
+      map(fonts => ({
+        "$schema": "https://json-schema.org/draft-07/schema",
+        "title": "Google Fonts",
+        "markdownDescription": "https://fonts.google.com/",
+        "type": "string",
+        "oneOf": fonts.map(font => ({
+          "title": font,
+          "markdownDescription": `https://fonts.google.com/specimen/${
+            font.replace(/\s+/g, "+")
+          }`,
+          "const": font,
+        }))
+      })),
+      switchMap(data => write(
+        "docs/schema/assets/fonts.json",
+        JSON.stringify(data, undefined, 2)
+      ))
+    ),
+
+  /* Compute icons schema */
+  icons$
+    .pipe(
+      map(icons => [...icons.values()]),
+      map(icons => ({
+        "$schema": "https://json-schema.org/draft-07/schema",
+        "title": "Icon",
+        "markdownDescription": [
+          "https://squidfunk.github.io/mkdocs-material",
+          "reference/icons-emojis/#search"
+        ].join("/"),
+        "type": "string",
+        "enum": icons.map(icon => assurePosixSep(icon.replace(".svg", "")))
+      })),
+      switchMap(data => write(
+        "docs/schema/assets/icons.json",
+        JSON.stringify(data, undefined, 2)
+      ))
+    )
+)
+
+/* Build overrides */
+const overrides$ =
+  process.argv.includes("--all")
+    ? merge(index$, schema$)
+    : EMPTY
+
 /* ----------------------------------------------------------------------------
  * Program
  * ------------------------------------------------------------------------- */
@@ -294,8 +470,8 @@ const index$ = zip(icons$, emojis$)
 /* Assemble pipeline */
 const build$ =
   process.argv.includes("--dirty")
-    ? templates$
-    : concat(assets$, merge(templates$, index$))
+    ? merge(templates$, sources$)
+    : concat(assets$, merge(templates$, sources$, overrides$))
 
 /* Let's get rolling */
 build$.subscribe()
