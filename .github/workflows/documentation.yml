@@ -87,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GOOGLE_ANALYTICS_KEY: ${{ secrets.GOOGLE_ANALYTICS_KEY }}
+          DISABLE_MKDOCS_2_WARNING: true
         run: |
           mkdocs build --clean
           mkdocs --version
